@@ -70,12 +70,6 @@ let rpcUrl = DEFAULT_RPC;
 /** @type {FaucetWorker[]} */
 let workers = [];
 let recentLogs = [];
-/** Global Cloudflare ban cooldown (ms timestamp) */
-let cfBlockedUntil = 0;
-let lastStartAt = 0;
-/** Soft gap only for logging/metrics — do NOT block /faucet/start for minutes */
-const START_STAGGER_MS = 400;
-
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
   recentLogs = [line, ...recentLogs].slice(0, 60);
@@ -86,29 +80,6 @@ function getApiKey() {
   return (runtimeCapsolverKey || process.env.CAPSOLVER_API_KEY || "").trim();
 }
 
-function markCloudflareBan(seconds = 45) {
-  // SHORT soft cooldown only — never freeze all 25 workers for 5-15 minutes
-  const until = Date.now() + seconds * 1000;
-  if (until > cfBlockedUntil) {
-    cfBlockedUntil = until;
-    log(
-      `Cloudflare soft cooldown ${seconds}s (until ${new Date(cfBlockedUntil).toLocaleTimeString()})`,
-    );
-  }
-}
-
-function cloudflareStatus() {
-  const now = Date.now();
-  if (now >= cfBlockedUntil) {
-    return { blocked: false, remainingSec: 0 };
-  }
-  return {
-    blocked: true,
-    remainingSec: Math.ceil((cfBlockedUntil - now) / 1000),
-    until: cfBlockedUntil,
-  };
-}
-
 function ensureWorkers(n) {
   const count = Math.max(1, Math.min(30, Number(n) || 1));
   while (workers.length < count) {
@@ -116,9 +87,6 @@ function ensureWorkers(n) {
     const w = new FaucetWorker(id, (m) => {
       recentLogs = [m, ...recentLogs].slice(0, 60);
       console.log(m);
-      if (/1015|cloudflare|ip rate limited/i.test(m)) {
-        markCloudflareBan(45);
-      }
     });
     workers.push(w);
     log(`worker ${id} created`);
@@ -132,14 +100,13 @@ function ensureWorkers(n) {
 }
 
 function poolSnapshot() {
-  const cf = cloudflareStatus();
   return {
     workers: workers.map((w) => w.snapshot()),
     workerCount: workers.length,
     busyCount: workers.filter((w) => w.busy).length,
     hasCapsolverKey: Boolean(getApiKey()),
     rpcUrl: rpcUrl.replace(/\/v2\/.*/, "/v2/***"),
-    cloudflare: cf,
+    cloudflare: { blocked: false, remainingSec: 0 },
     logs: recentLogs.slice(0, 20),
   };
 }
@@ -281,18 +248,7 @@ app.post("/faucet/start", async (req, res) => {
     return res.status(400).json({ error: "CapSolver API key required" });
   }
 
-  // Soft CF throttle only (short). Do NOT hard-block the whole pool for minutes.
-  const cf = cloudflareStatus();
-  if (cf.blocked) {
-    return res.status(503).json({
-      error: `Cloudflare soft cooldown ~${cf.remainingSec}s (browsers still open one-by-one after).`,
-      cloudflare: true,
-      remainingSec: Math.min(cf.remainingSec, 45),
-      retryable: true,
-    });
-  }
-
-  // optional pre-check
+  // optional pre-check (wallet 2h limit only — no global cooldown)
   if (req.body?.skipCheck !== true) {
     try {
       const check = await checkRecentFaucetClaim(rpcUrl, address);
@@ -312,7 +268,9 @@ app.post("/faucet/start", async (req, res) => {
   if (req.body?.workerId) {
     worker = workers.find((w) => w.id === Number(req.body.workerId));
     if (!worker) return res.status(404).json({ error: "Worker not found" });
-    if (worker.busy) return res.status(409).json({ error: "Worker busy", retryable: true });
+    if (worker.busy) {
+      return res.status(409).json({ error: "Worker busy", retryable: true });
+    }
   } else {
     worker = workers.find((w) => !w.busy);
     if (!worker) {
@@ -325,28 +283,21 @@ app.post("/faucet/start", async (req, res) => {
     }
   }
 
-  // Tiny non-blocking stagger bookkeeping only (browser open is already one-by-one)
-  lastStartAt = Date.now();
-  const runId = worker.runId + 1;
-
-  // Mark busy immediately so two jobs don't grab same worker
   if (worker.busy) {
     return res.status(409).json({ error: "Worker became busy", retryable: true });
   }
 
+  const runId = worker.runId + 1;
   res.json({
     ok: true,
     workerId: worker.id,
     runId,
   });
 
-  // Fire and forget — browser opens inside worker via one-by-one launch queue
+  // Fire and forget — no global cooldown, keep trying
   worker.run(address, getApiKey()).catch((e) => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`W${worker.id} failed: ${msg}`);
-    if (/1015|cloudflare|ip rate limited|banned you temporarily/i.test(msg)) {
-      markCloudflareBan(45);
-    }
   });
 });
 

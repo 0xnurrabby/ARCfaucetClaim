@@ -150,7 +150,6 @@ export default function App() {
   >([]);
   const [botOnline, setBotOnline] = useState(false);
   const [workers, setWorkers] = useState<WorkerSnap[]>([]);
-  const [cfBan, setCfBan] = useState<{ blocked: boolean; remainingSec?: number } | null>(null);
   const [queueRunning, setQueueRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [capBalance, setCapBalance] = useState<number | null>(null);
@@ -221,7 +220,6 @@ export default function App() {
         if (!cancelled) {
           setBotOnline(true);
           setWorkers(data.workers || []);
-          setCfBan(data.cloudflare || null);
         }
       } catch {
         if (!cancelled) {
@@ -512,11 +510,12 @@ export default function App() {
         .formatted,
     );
 
-    // Retry start on busy / CF cooldown (do not burn the wallet as permanent error)
+    // Keep trying forever until start succeeds (or stop / 2h wallet skip)
     let startRes: Response | null = null;
     let startData: Record<string, unknown> = {};
-    for (let attempt = 0; attempt < 8; attempt++) {
-      if (stopRef.current) throw new Error("Queue stopped");
+    let attempt = 0;
+    while (!stopRef.current) {
+      attempt += 1;
       startRes = await fetch(`${API_BASE}/faucet/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -528,6 +527,7 @@ export default function App() {
       });
       startData = await startRes.json().catch(() => ({}));
 
+      // Only real per-wallet 2h faucet limit is a permanent skip
       if (startRes.status === 429 || startData.limited) {
         try {
           await drainToVault(job);
@@ -543,90 +543,103 @@ export default function App() {
         return;
       }
 
-      // Cloudflare IP ban / all busy / stagger: wait and retry
-      if (
-        startRes.status === 503 ||
-        startRes.status === 409 ||
-        startData.cloudflare ||
-        startData.retryable
-      ) {
-        // Short waits only — never sleep 5+ minutes per wallet
-        const raw = Number(startData.remainingSec) || 2 + attempt;
-        const waitSec = Math.min(raw, startData.cloudflare ? 8 : 3);
-        pushLog(
-          `[${shortAddress(job.address)}] wait ${waitSec}s (${String(startData.error || startRes.status)})`,
-          "info",
-        );
-        await sleep(waitSec * 1000);
-        continue;
-      }
-
       if (startRes.ok) break;
 
-      patchWallet(job.id, {
-        status: "error",
-        error: String(startData.error || `Start failed ${startRes.status}`),
-        workerId: null,
-      });
-      return;
+      // busy / temp / network: retry forever with short delay
+      const waitMs = Math.min(1500 + (attempt % 5) * 300, 3000);
+      if (attempt === 1 || attempt % 10 === 0) {
+        pushLog(
+          `[${shortAddress(job.address)}] retry start #${attempt}: ${String(startData.error || startRes.status)}`,
+          "info",
+        );
+      }
+      await sleep(waitMs);
     }
 
+    if (stopRef.current) {
+      patchWallet(job.id, { status: "queued", workerId: null });
+      throw new Error("Queue stopped");
+    }
     if (!startRes?.ok) {
-      // put back in queue instead of dying
-      patchWallet(job.id, {
-        status: "queued",
-        error: "Waiting for Cloudflare cooldown / free worker",
-        workerId: null,
-      });
-      await sleep(5000);
+      patchWallet(job.id, { status: "queued", workerId: null });
       return;
     }
 
-    const workerId = Number(startData.workerId);
-    const minRunId = Number(startData.runId) || 1;
+    let workerId = Number(startData.workerId);
+    let minRunId = Number(startData.runId) || 1;
     patchWallet(job.id, { workerId, status: "claiming" });
     pushLog(
       `[${shortAddress(job.address)}] W${workerId} run #${minRunId}`,
       "info",
     );
 
-    try {
-      await waitWorkerDone(workerId, minRunId);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+    // Keep trying this wallet until faucet succeeds (or 2h skip / stop)
+    for (;;) {
       try {
-        await drainToVault(job);
-      } catch {
-        /* ignore */
-      }
-      if (isRateLimit(msg)) {
-        patchWallet(job.id, {
-          status: "skipped",
-          error: "Rate limited",
-          workerId: null,
-        });
-        return;
-      }
-      // Cloudflare / form timeout: re-queue later instead of permanent error
-      if (
-        /1015|cloudflare|ip rate limited|form not loaded|timeout|context|browser/i.test(
-          msg,
-        )
-      ) {
-        patchWallet(job.id, {
-          status: "queued",
-          error: "temporary - retry",
-          workerId: null,
-        });
+        await waitWorkerDone(workerId, minRunId);
+        break;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        try {
+          await drainToVault(job);
+        } catch {
+          /* ignore */
+        }
+        if (isRateLimit(msg)) {
+          patchWallet(job.id, {
+            status: "skipped",
+            error: "Rate limited",
+            workerId: null,
+          });
+          return;
+        }
+        if (stopRef.current || msg.includes("Queue stopped")) {
+          patchWallet(job.id, { status: "queued", workerId: null });
+          throw new Error("Queue stopped");
+        }
+        // Any other fail: restart claim immediately, no long cooldown
         pushLog(
-          `[${shortAddress(job.address)}] re-queued: ${msg.slice(0, 90)}`,
+          `[${shortAddress(job.address)}] retry claim: ${msg.slice(0, 100)}`,
           "info",
         );
-        await sleep(1200);
-        return;
+        patchWallet(job.id, { status: "claiming", error: null, workerId: null });
+        await sleep(800);
+
+        // re-start worker job
+        let ok = false;
+        while (!stopRef.current && !ok) {
+          const r = await fetch(`${API_BASE}/faucet/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              address: job.address,
+              apiKey: s.capsolverKey || undefined,
+              skipCheck: true,
+            }),
+          });
+          const d = await r.json().catch(() => ({}));
+          if (r.status === 429 || d.limited) {
+            patchWallet(job.id, {
+              status: "skipped",
+              error: String(d.error || "Rate limited"),
+              workerId: null,
+            });
+            return;
+          }
+          if (r.ok) {
+            workerId = Number(d.workerId);
+            minRunId = Number(d.runId) || 1;
+            patchWallet(job.id, { workerId, status: "claiming" });
+            ok = true;
+            break;
+          }
+          await sleep(1000);
+        }
+        if (stopRef.current) {
+          patchWallet(job.id, { status: "queued", workerId: null });
+          throw new Error("Queue stopped");
+        }
       }
-      patchWallet(job.id, { status: "error", error: msg, workerId: null });
-      return;
     }
 
     pushLog(`[${shortAddress(job.address)}] faucet OK`, "ok");
@@ -1043,17 +1056,6 @@ export default function App() {
               <span className="pill ok">RPC saved</span>
             )}
           </div>
-
-          {cfBan?.blocked && (
-            <div
-              className="alert"
-              style={{ borderColor: "rgba(255,107,107,0.45)" }}
-            >
-              <strong>Cloudflare IP ban (Error 1015).</strong> Circle temporarily
-              blocked this IP. Wait ~{cfBan.remainingSec ?? "?"}s. Use 2-4
-              parallel browsers (not 25+). Queue will auto-retry.
-            </div>
-          )}
 
           {workers.length > 0 && (
             <div className="stats">
