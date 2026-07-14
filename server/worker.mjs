@@ -238,50 +238,78 @@ export class FaucetWorker {
     }
   }
 
+  /**
+   * Load faucet page. On CF 1015 / blank page: hard refresh and keep trying.
+   */
   async openFaucet() {
     await this.ensureBrowser();
     if (!this.page || this.page.isClosed()) {
       this.page = await this.context.newPage();
     }
-    this.setStatus("running", "Opening faucet…");
-    await this.page.goto(FAUCET_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
 
-    const cf = await this.detectCloudflareBlock();
-    if (cf.blocked) {
-      const err = new Error(cf.message);
-      // @ts-ignore
-      err.code = "CF_1015";
-      throw err;
-    }
-
-    const addressInput = this.page
-      .getByPlaceholder(/wallet address/i)
-      .or(this.page.locator('input[placeholder*="address" i]'))
-      .first();
-    try {
-      await addressInput.waitFor({ state: "visible", timeout: 20000 });
-    } catch {
-      const cf2 = await this.detectCloudflareBlock();
-      if (cf2.blocked) {
-        const err = new Error(cf2.message);
-        // @ts-ignore
-        err.code = "CF_1015";
-        throw err;
-      }
-      throw new Error(
-        "Faucet form not loaded (timeout). Cloudflare may be blocking this IP.",
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      this.setStatus(
+        "running",
+        attempt === 1 ? "Opening faucet…" : `Refresh retry #${attempt}…`,
       );
-    }
 
-    await this.sendBtn()
-      .waitFor({ state: "visible", timeout: 10000 })
-      .catch(() => {});
+      try {
+        // Hard navigation = full refresh
+        await this.page.goto(FAUCET_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 45000,
+        });
+      } catch (e) {
+        this.log(
+          `goto fail: ${e instanceof Error ? e.message : e} — refresh again`,
+        );
+        await sleep(1500);
+        continue;
+      }
 
-    if (!this.page.url().includes("faucet.circle.com")) {
-      throw new Error(`Wrong URL: ${this.page.url()}`);
+      const cf = await this.detectCloudflareBlock();
+      if (cf.blocked) {
+        this.log(`CF/rate page hit — refresh & retry #${attempt}`);
+        await sleep(2000);
+        // hard reload
+        try {
+          await this.page.reload({
+            waitUntil: "domcontentloaded",
+            timeout: 30000,
+          });
+        } catch {
+          /* next loop will goto again */
+        }
+        await sleep(1500);
+        continue;
+      }
+
+      const addressInput = this.page
+        .getByPlaceholder(/wallet address/i)
+        .or(this.page.locator('input[placeholder*="address" i]'))
+        .first();
+      try {
+        await addressInput.waitFor({ state: "visible", timeout: 15000 });
+      } catch {
+        this.log(`form not ready — refresh & retry #${attempt}`);
+        await sleep(1500);
+        continue;
+      }
+
+      await this.sendBtn()
+        .waitFor({ state: "visible", timeout: 8000 })
+        .catch(() => {});
+
+      if (!this.page.url().includes("faucet.circle.com")) {
+        this.log(`wrong url ${this.page.url()} — refresh`);
+        await sleep(1000);
+        continue;
+      }
+
+      // form ready
+      return;
     }
   }
 
@@ -363,6 +391,8 @@ export class FaucetWorker {
   }
 
   /**
+   * Full claim attempt. On CF / captcha / network fail: refresh page and retry
+   * forever until success or permanent 2h wallet limit.
    * @param {string} address
    * @param {string} apiKey
    */
@@ -378,187 +408,273 @@ export class FaucetWorker {
     try {
       if (!apiKey) throw new Error("No CapSolver key");
 
-      await this.openFaucet();
-      const networkKeys = [];
-      const apiHits = [];
+      let attempt = 0;
+      while (true) {
+        attempt += 1;
+        this.setStatus(
+          "running",
+          attempt === 1
+            ? `Claim run #${myRun}`
+            : `Retry #${attempt} (refresh browser)…`,
+        );
 
-      this.detachPageListeners();
-      this._onReq = (req) => {
-        const u = req.url();
-        if (/recaptcha/i.test(u)) {
-          try {
-            const k = new URL(u).searchParams.get("k");
-            if (k?.startsWith("6L") && !networkKeys.includes(k)) {
-              networkKeys.push(k);
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-      };
-      this._onRes = async (res) => {
         try {
-          const url = res.url();
-          const kind = res.request().resourceType();
-          if (
-            (kind === "xhr" || kind === "fetch") &&
-            /faucet\.circle\.com\/api|graphql/i.test(url)
-          ) {
-            let body = "";
+          // Always fresh page load on each attempt
+          await this.openFaucet();
+
+          const networkKeys = [];
+          const apiHits = [];
+
+          this.detachPageListeners();
+          this._onReq = (req) => {
+            const u = req.url();
+            if (/recaptcha/i.test(u)) {
+              try {
+                const k = new URL(u).searchParams.get("k");
+                if (k?.startsWith("6L") && !networkKeys.includes(k)) {
+                  networkKeys.push(k);
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          };
+          this._onRes = async (res) => {
             try {
-              body = await res.text();
+              const url = res.url();
+              const kind = res.request().resourceType();
+              if (
+                (kind === "xhr" || kind === "fetch") &&
+                /faucet\.circle\.com\/api|graphql/i.test(url)
+              ) {
+                let body = "";
+                try {
+                  body = await res.text();
+                } catch {
+                  body = "";
+                }
+                if (body.length < 80000) {
+                  apiHits.push({ status: res.status(), body });
+                  this.log(`API ${res.status()}`);
+                }
+              }
             } catch {
-              body = "";
+              /* ignore */
             }
-            if (body.length < 80000) {
-              apiHits.push({ status: res.status(), body });
-              this.log(`API ${res.status()}`);
+          };
+          this.page.on("request", this._onReq);
+          this.page.on("response", this._onRes);
+
+          this.setStatus("running", "Filling form…");
+          await this.fillForm(address);
+
+          this.setStatus("running", "Send #1…");
+          let btn = this.sendBtn();
+          await btn.scrollIntoViewIfNeeded().catch(() => {});
+          await btn
+            .click({ timeout: 10000 })
+            .catch(() => btn.click({ force: true }));
+
+          for (let i = 0; i < 20; i++) {
+            const ok = await this.page.evaluate(() => {
+              const t = (document.body?.innerText || "").toLowerCase();
+              return (
+                t.includes("i'm not a robot") ||
+                t.includes("unusual traffic") ||
+                Boolean(document.querySelector("iframe[src*='recaptcha']"))
+              );
+            });
+            if (ok) break;
+            await sleep(250);
+          }
+
+          // CF page after send?
+          {
+            const cf = await this.detectCloudflareBlock();
+            if (cf.blocked) {
+              this.log("CF after Send#1 — refresh & retry");
+              await sleep(1500);
+              continue;
             }
           }
-        } catch {
-          /* ignore */
-        }
-      };
-      this.page.on("request", this._onReq);
-      this.page.on("response", this._onRes);
 
-      this.setStatus("running", "Filling form…");
-      await this.fillForm(address);
+          const siteKeys = await this.extractSiteKeys(networkKeys);
+          this.log(`keys: ${siteKeys.map((k) => k.slice(0, 10)).join(",")}`);
 
-      if (!this.page.url().includes("faucet.circle.com")) {
-        throw new Error("Lost faucet page");
-      }
+          let token = null;
+          let lastErr = null;
+          for (const websiteKey of siteKeys) {
+            try {
+              this.setStatus(
+                "solving_captcha",
+                `CapSolver ${websiteKey.slice(0, 12)}…`,
+              );
+              const result = await solveRecaptchaV2(
+                apiKey,
+                {
+                  websiteURL: FAUCET_URL,
+                  websiteKey,
+                  isInvisible: websiteKey === INVIS_KEY,
+                },
+                (m) => this.setStatus("solving_captcha", m),
+              );
+              token = result.token;
+              this.log(`SOLVED ${result.taskType}`);
+              break;
+            } catch (e) {
+              lastErr = e instanceof Error ? e.message : String(e);
+              this.log(`solve fail: ${lastErr}`);
+            }
+          }
+          if (!token) {
+            this.log(`CapSolver failed — refresh & retry: ${lastErr}`);
+            await sleep(1000);
+            continue;
+          }
+          if (this.page.isClosed()) {
+            this.log("tab closed — reopen browser");
+            await this.resetBrowser().catch(() => {});
+            continue;
+          }
 
-      this.setStatus("running", "Send #1…");
-      let btn = this.sendBtn();
-      await btn.scrollIntoViewIfNeeded().catch(() => {});
-      await btn.click({ timeout: 10000 }).catch(() => btn.click({ force: true }));
+          this.setStatus("submitting", "Inject token…");
+          await injectRecaptchaToken(this.page, token);
+          await sleep(120);
+          await injectRecaptchaToken(this.page, token);
 
-      for (let i = 0; i < 20; i++) {
-        const ok = await this.page.evaluate(() => {
-          const t = (document.body?.innerText || "").toLowerCase();
-          return (
-            t.includes("i'm not a robot") ||
-            t.includes("unusual traffic") ||
-            Boolean(document.querySelector("iframe[src*='recaptcha']"))
-          );
-        });
-        if (ok) break;
-        await sleep(250);
-      }
+          this.setStatus("submitting", "Send #2…");
+          btn = this.sendBtn();
+          const before = apiHits.length;
+          await btn
+            .click({ timeout: 8000 })
+            .catch(() => btn.click({ force: true }));
 
-      const siteKeys = await this.extractSiteKeys(networkKeys);
-      this.log(`keys: ${siteKeys.map((k) => k.slice(0, 10)).join(",")}`);
+          this.setStatus("submitting", "Waiting API…");
+          let outcome = "unknown";
+          const deadline = Date.now() + 25000;
+          while (Date.now() < deadline) {
+            for (const hit of apiHits.slice(before)) {
+              const b = (hit.body || "").toLowerCase();
+              if (hit.status >= 200 && hit.status < 300) {
+                if (/limit|exceed|too many|rate/i.test(b)) outcome = "limit";
+                else if (/captcha|recaptcha|robot|invalid token/i.test(b))
+                  outcome = "captcha_fail";
+                else if (/"data"|success|txid|request/i.test(b))
+                  outcome = "success";
+              } else if (hit.status === 429) outcome = "limit";
+              else if (hit.status >= 400) {
+                if (/limit|exceed/i.test(b)) outcome = "limit";
+                if (/captcha|robot|token/i.test(b)) outcome = "captcha_fail";
+              }
+            }
+            if (outcome !== "unknown") break;
 
-      let token = null;
-      let lastErr = null;
-      for (const websiteKey of siteKeys) {
-        try {
-          this.setStatus(
-            "solving_captcha",
-            `CapSolver ${websiteKey.slice(0, 12)}…`,
-          );
-          const result = await solveRecaptchaV2(
-            apiKey,
-            {
-              websiteURL: FAUCET_URL,
-              websiteKey,
-              isInvisible: websiteKey === INVIS_KEY,
-            },
-            (m) => this.setStatus("solving_captcha", m),
-          );
-          token = result.token;
-          this.log(`SOLVED ${result.taskType}`);
-          break;
+            const live = await this.page.evaluate(() => {
+              const t = (document.body?.innerText || "").toLowerCase();
+              const faq = t.indexOf("frequently asked");
+              return faq > 0 ? t.slice(0, faq) : t;
+            });
+            if (
+              /successfully|tokens sent|usdc sent|request submitted/i.test(live)
+            ) {
+              outcome = "success";
+              break;
+            }
+            if (
+              (/limit exceeded|you have exceeded|rate limit/i.test(live) ||
+                /try again later/i.test(live)) &&
+              !/why am i seeing/i.test(live)
+            ) {
+              outcome = "limit";
+              break;
+            }
+            // CF mid-wait
+            if (
+              /error 1015|you are being rate limited|access denied/i.test(live)
+            ) {
+              outcome = "cf";
+              break;
+            }
+            await sleep(250);
+          }
+
+          if (outcome === "unknown") {
+            const still = await this.page.evaluate(() =>
+              (document.body?.innerText || "")
+                .toLowerCase()
+                .includes("unusual traffic"),
+            );
+            outcome = still ? "captcha_fail" : "soft_success";
+          }
+
+          this.log(`outcome=${outcome} attempt=${attempt}`);
+
+          // Permanent only: real per-wallet 2h faucet limit
+          if (outcome === "limit") {
+            throw new Error(
+              "Faucet limit exceeded (20 USDC / address / 2h). Use new wallet.",
+            );
+          }
+
+          // Everything else: refresh and try again
+          if (
+            outcome === "captcha_fail" ||
+            outcome === "cf" ||
+            outcome === "unknown"
+          ) {
+            this.log(`${outcome} — browser refresh & retry`);
+            await sleep(1200);
+            continue;
+          }
+
+          // success / soft_success
+          this.setStatus("done", `OK run #${myRun}`);
+          await this.page
+            .goto(FAUCET_URL, {
+              waitUntil: "domcontentloaded",
+              timeout: 15000,
+            })
+            .catch(() => {});
+          this.setStatus("idle", `Ready (last #${myRun} OK)`);
+          return { ok: true, runId: myRun, outcome };
         } catch (e) {
-          lastErr = e instanceof Error ? e.message : String(e);
-          this.log(`solve fail: ${lastErr}`);
-        }
-      }
-      if (!token) throw new Error(`CapSolver failed: ${lastErr}`);
-      if (this.page.isClosed()) throw new Error("Tab closed during CapSolver");
-
-      this.setStatus("submitting", "Inject token…");
-      await injectRecaptchaToken(this.page, token);
-      await sleep(120);
-      await injectRecaptchaToken(this.page, token);
-
-      this.setStatus("submitting", "Send #2…");
-      btn = this.sendBtn();
-      const before = apiHits.length;
-      await btn.click({ timeout: 8000 }).catch(() => btn.click({ force: true }));
-
-      this.setStatus("submitting", "Waiting API…");
-      let outcome = "unknown";
-      const deadline = Date.now() + 25000;
-      while (Date.now() < deadline) {
-        for (const hit of apiHits.slice(before)) {
-          const b = (hit.body || "").toLowerCase();
-          if (hit.status >= 200 && hit.status < 300) {
-            if (/limit|exceed|too many|rate/i.test(b)) outcome = "limit";
-            else if (/captcha|recaptcha|robot|invalid token/i.test(b))
-              outcome = "captcha_fail";
-            else if (/"data"|success|txid|request/i.test(b)) outcome = "success";
-          } else if (hit.status === 429) outcome = "limit";
-          else if (hit.status >= 400) {
-            if (/limit|exceed/i.test(b)) outcome = "limit";
-            if (/captcha|robot|token/i.test(b)) outcome = "captcha_fail";
+          const msg = e instanceof Error ? e.message : String(e);
+          // Permanent wallet limit bubbles out
+          if (
+            /20 usdc \/ address|faucet limit exceeded|every 2h|last 2h/i.test(
+              msg,
+            )
+          ) {
+            throw e;
           }
+          // Any other error: refresh and retry forever
+          this.lastError = msg;
+          this.log(`fail: ${msg.slice(0, 120)} — refresh & retry`);
+          if (/closed|target page|context|browser has been closed/i.test(msg)) {
+            await this.resetBrowser().catch(() => {});
+          } else {
+            try {
+              await this.page?.reload({
+                waitUntil: "domcontentloaded",
+                timeout: 20000,
+              });
+            } catch {
+              try {
+                await this.page?.goto(FAUCET_URL, {
+                  waitUntil: "domcontentloaded",
+                  timeout: 30000,
+                });
+              } catch {
+                /* next openFaucet will handle */
+              }
+            }
+          }
+          await sleep(1500);
         }
-        if (outcome !== "unknown") break;
-
-        const live = await this.page.evaluate(() => {
-          const t = (document.body?.innerText || "").toLowerCase();
-          const faq = t.indexOf("frequently asked");
-          return faq > 0 ? t.slice(0, faq) : t;
-        });
-        if (/successfully|tokens sent|usdc sent|request submitted/i.test(live)) {
-          outcome = "success";
-          break;
-        }
-        if (
-          (/limit exceeded|you have exceeded|rate limit/i.test(live) ||
-            /try again later/i.test(live)) &&
-          !/why am i seeing/i.test(live)
-        ) {
-          outcome = "limit";
-          break;
-        }
-        await sleep(250);
       }
-
-      if (outcome === "unknown") {
-        const still = await this.page.evaluate(() =>
-          (document.body?.innerText || "")
-            .toLowerCase()
-            .includes("unusual traffic"),
-        );
-        outcome = still ? "captcha_fail" : "soft_success";
-      }
-
-      this.log(`outcome=${outcome} run=${myRun}`);
-      if (outcome === "limit") {
-        throw new Error(
-          "Faucet limit exceeded (20 USDC / address / 2h). Use new wallet.",
-        );
-      }
-      if (outcome === "captcha_fail") {
-        throw new Error("Captcha rejected — retry");
-      }
-
-      this.setStatus("done", `OK run #${myRun}`);
-      await this.page
-        .goto(FAUCET_URL, { waitUntil: "domcontentloaded", timeout: 15000 })
-        .catch(() => {});
-      this.setStatus("idle", `Ready (last #${myRun} OK)`);
-      return { ok: true, runId: myRun, outcome };
     } catch (e) {
       this.lastError = e instanceof Error ? e.message : String(e);
       this.setStatus("error", this.lastError);
-      // keep browser open for soft errors; only reset on hard crashes
-      if (/closed|target page|context|browser has been closed/i.test(this.lastError)) {
-        await this.resetBrowser().catch(() => {});
-      }
       this.status = "idle";
       throw e;
     } finally {
