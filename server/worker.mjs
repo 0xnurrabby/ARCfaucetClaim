@@ -264,66 +264,149 @@ export class FaucetWorker {
     this.context = null;
   }
 
-  async detectCloudflareBlock() {
+  /**
+   * Page state machine for faucet.circle.com
+   * @returns {Promise<'form'|'error'|'cf'|'unknown'>}
+   */
+  async detectPageState() {
     try {
-      const info = await this.page.evaluate(() => {
+      return await this.page.evaluate(() => {
         const t = (document.body?.innerText || "").toLowerCase();
         const title = (document.title || "").toLowerCase();
-        return {
-          has1015: t.includes("error 1015") || t.includes("1015"),
-          rateLimited:
-            t.includes("you are being rate limited") ||
-            t.includes("access denied") ||
-            t.includes("banned you temporarily") ||
-            title.includes("access denied"),
-        };
+
+        // Circle "Something went wrong" error UI
+        if (
+          t.includes("something went wrong") ||
+          (t.includes("try again") && t.includes("problem persists")) ||
+          !!document.querySelector('button') &&
+            [...document.querySelectorAll("button")].some((b) =>
+              /^retry$/i.test((b.textContent || "").trim()),
+            ) &&
+            t.includes("something went wrong")
+        ) {
+          return "error";
+        }
+        // Retry button alone with no form
+        const hasRetry = [...document.querySelectorAll("button")].some((b) =>
+          /^retry$/i.test((b.textContent || "").trim()),
+        );
+        const hasWallet =
+          !!document.querySelector('input[placeholder*="address" i]') ||
+          !!document.querySelector('input[placeholder*="Wallet" i]');
+        if (hasRetry && !hasWallet) return "error";
+
+        if (
+          t.includes("error 1015") ||
+          t.includes("you are being rate limited") ||
+          t.includes("access denied") ||
+          t.includes("banned you temporarily") ||
+          title.includes("access denied")
+        ) {
+          return "cf";
+        }
+
+        // Real faucet form
+        if (
+          hasWallet ||
+          (t.includes("testnet faucet") && t.includes("send to")) ||
+          (t.includes("usdc") && t.includes("send") && t.includes("wallet"))
+        ) {
+          return "form";
+        }
+        return "unknown";
       });
-      if (info.has1015 || info.rateLimited) {
-        return {
-          blocked: true,
-          message:
-            "Cloudflare Error 1015: IP rate limited. Lower parallel and wait.",
-        };
-      }
-      return { blocked: false };
     } catch {
-      return { blocked: false };
+      return "unknown";
+    }
+  }
+
+  async detectCloudflareBlock() {
+    const state = await this.detectPageState();
+    if (state === "cf") {
+      return {
+        blocked: true,
+        message:
+          "Cloudflare Error 1015: IP rate limited. Lower parallel and wait.",
+      };
+    }
+    return { blocked: false };
+  }
+
+  async hardRefresh() {
+    try {
+      await this.page.goto(FAUCET_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+    } catch {
+      try {
+        await this.page.reload({
+          waitUntil: "domcontentloaded",
+          timeout: 20000,
+        });
+      } catch {
+        /* ignore */
+      }
     }
   }
 
   /**
-   * Wait until wallet form is visible (poll fast — start work the moment page is ready).
+   * Wait until real faucet form is ready. On error page: click Retry / reload.
    * @param {number} maxMs
    */
-  async waitForFormReady(maxMs = 12000) {
+  async waitForFormReady(maxMs = 15000) {
     const end = Date.now() + maxMs;
-    const addressInput = this.page
-      .getByPlaceholder(/wallet address/i)
-      .or(this.page.locator('input[placeholder*="address" i]'))
-      .first();
     while (Date.now() < end) {
       if (this.page.isClosed()) return false;
-      const cf = await this.detectCloudflareBlock();
-      if (cf.blocked) return false;
-      try {
-        if (await addressInput.isVisible().catch(() => false)) {
-          // Send button may appear a tick later — don't block long
+
+      const state = await this.detectPageState();
+      if (state === "form") {
+        // confirm inputs really there
+        const ok = await this.page
+          .getByPlaceholder(/wallet address/i)
+          .or(this.page.locator('input[placeholder*="address" i]'))
+          .first()
+          .isVisible()
+          .catch(() => false);
+        if (ok) {
           await this.sendBtn()
-            .waitFor({ state: "visible", timeout: 2000 })
+            .waitFor({ state: "visible", timeout: 2500 })
             .catch(() => {});
           return true;
         }
-      } catch {
-        /* keep polling */
       }
+
+      if (state === "error") {
+        this.log("Something went wrong page — clicking Retry / reloading");
+        // Try site Retry button first
+        try {
+          const retry = this.page
+            .getByRole("button", { name: /^retry$/i })
+            .or(this.page.locator("button").filter({ hasText: /^retry$/i }))
+            .first();
+          if (await retry.isVisible({ timeout: 800 }).catch(() => false)) {
+            await retry.click({ timeout: 3000 }).catch(() => {});
+            await sleep(800);
+            continue;
+          }
+        } catch {
+          /* fall through to hard refresh */
+        }
+        await this.hardRefresh();
+        await sleep(600);
+        continue;
+      }
+
+      if (state === "cf") return false;
+
       await sleep(150);
     }
     return false;
   }
 
   /**
-   * Load faucet page. On CF 1015 / blank: refresh and keep trying.
-   * As soon as form appears → return immediately (no stuck waiting).
+   * Load faucet until REAL form is visible.
+   * "Something went wrong" => keep Retry/reload forever.
    */
   async openFaucet() {
     await this.ensureBrowser();
@@ -336,47 +419,29 @@ export class FaucetWorker {
       attempt += 1;
       this.setStatus(
         "running",
-        attempt === 1 ? "Opening faucet…" : `Refresh #${attempt}…`,
+        attempt === 1 ? "Opening faucet…" : `Reload until form #${attempt}…`,
       );
 
       try {
-        // commit = return as soon as navigation starts loading (faster than full load)
         await this.page.goto(FAUCET_URL, {
-          waitUntil: "commit",
-          timeout: 30000,
+          waitUntil: "domcontentloaded",
+          timeout: 35000,
         });
       } catch (e) {
         this.log(`goto fail — retry: ${e instanceof Error ? e.message : e}`);
-        await sleep(600);
+        await sleep(500);
         continue;
       }
 
-      // Poll: the moment form is there, go work (don't sit idle)
-      const ready = await this.waitForFormReady(10000);
+      const ready = await this.waitForFormReady(12000);
       if (ready) {
-        this.log("form ready — starting claim");
+        this.log("faucet form ready — starting claim now");
         return;
       }
 
-      const cf = await this.detectCloudflareBlock();
-      if (cf.blocked) {
-        this.log(`CF/rate page — hard refresh #${attempt}`);
-      } else {
-        this.log(`form not ready — hard refresh #${attempt}`);
-      }
-
-      try {
-        await this.page.goto(FAUCET_URL, {
-          waitUntil: "commit",
-          timeout: 30000,
-        });
-      } catch {
-        try {
-          await this.page.reload({ waitUntil: "commit", timeout: 20000 });
-        } catch {
-          /* loop */
-        }
-      }
+      const state = await this.detectPageState();
+      this.log(`page=${state} — hard refresh #${attempt}`);
+      await this.hardRefresh();
       await sleep(400);
     }
   }
@@ -388,14 +453,50 @@ export class FaucetWorker {
       .first();
   }
 
+  /**
+   * Run step with hard timeout — if stuck, throw so outer loop refreshes.
+   * @template T
+   * @param {string} label
+   * @param {() => Promise<T>} fn
+   * @param {number} ms
+   */
+  async withTimeout(label, fn, ms = 20000) {
+    let timer;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`STUCK timeout ${ms}ms at: ${label}`)),
+            ms,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async fillForm(address) {
     const p = this.page;
+
+    // If error page snuck in, fail fast so we refresh
+    const state = await this.detectPageState();
+    if (state === "error" || state === "cf") {
+      throw new Error(`Bad page before fill: ${state}`);
+    }
+    if (state !== "form") {
+      // one quick wait
+      const ok = await this.waitForFormReady(5000);
+      if (!ok) throw new Error("Form not ready for fill");
+    }
+
     try {
       await p
         .getByRole("button", { name: /^USDC$/i })
         .or(p.locator("button").filter({ hasText: /^USDC$/ }))
         .first()
-        .click({ timeout: 1500 });
+        .click({ timeout: 1200 });
     } catch {
       /* ok */
     }
@@ -404,7 +505,7 @@ export class FaucetWorker {
       const netText = await p
         .locator("label:has-text('Network')")
         .locator("..")
-        .innerText({ timeout: 800 })
+        .innerText({ timeout: 600 })
         .catch(() => "");
       if (!/Arc Testnet/i.test(netText)) {
         await p
@@ -413,12 +514,14 @@ export class FaucetWorker {
           .locator('button, [role="combobox"]')
           .first()
           .or(p.getByRole("combobox").first())
-          .click({ timeout: 1500 });
+          .click({ timeout: 1200 });
         await p
           .getByRole("option", { name: /Arc Testnet/i })
-          .or(p.locator('[role="option"], li').filter({ hasText: /Arc Testnet/i }))
+          .or(
+            p.locator('[role="option"], li').filter({ hasText: /Arc Testnet/i }),
+          )
           .first()
-          .click({ timeout: 1500 });
+          .click({ timeout: 1200 });
       }
     } catch {
       /* ok */
@@ -428,12 +531,21 @@ export class FaucetWorker {
       .getByPlaceholder(/wallet address/i)
       .or(p.locator('input[placeholder*="address" i]'))
       .first();
+    await input.waitFor({ state: "visible", timeout: 5000 });
+    await input.click({ timeout: 2000 }).catch(() => {});
+    await input.fill("");
     await input.fill(address);
     await input.evaluate((el, val) => {
       el.value = val;
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     }, address);
+
+    // Verify value stuck
+    const v = await input.inputValue().catch(() => "");
+    if (!v || v.length < 10) {
+      throw new Error("Address fill failed");
+    }
   }
 
   async extractSiteKeys(networkKeys) {
@@ -553,21 +665,42 @@ export class FaucetWorker {
             /* optional */
           }
 
-          // Form is already visible → work immediately, no extra wait
-          this.setStatus("running", "Filling form…");
-          await this.fillForm(address);
+          // Double-check form (not error page) right before work
+          {
+            const st = await this.detectPageState();
+            if (st !== "form") {
+              this.log(`not form (${st}) — refresh`);
+              await sleep(200);
+              continue;
+            }
+          }
 
-          this.setStatus("running", "Send #1…");
-          let btn = this.sendBtn();
-          await btn.scrollIntoViewIfNeeded().catch(() => {});
-          await btn
-            .click({ timeout: 8000 })
-            .catch(() => btn.click({ force: true }));
+          await this.withTimeout(
+            "fillForm",
+            async () => {
+              this.setStatus("running", "Filling form…");
+              await this.fillForm(address);
+            },
+            12000,
+          );
 
-          // Short captcha UI poll (don't stall)
-          for (let i = 0; i < 12; i++) {
-            const cfMid = await this.detectCloudflareBlock();
-            if (cfMid.blocked) break;
+          await this.withTimeout(
+            "send1",
+            async () => {
+              this.setStatus("running", "Send #1…");
+              const btn = this.sendBtn();
+              await btn.scrollIntoViewIfNeeded().catch(() => {});
+              await btn
+                .click({ timeout: 6000 })
+                .catch(() => btn.click({ force: true }));
+            },
+            10000,
+          );
+
+          // Short captcha UI poll
+          for (let i = 0; i < 10; i++) {
+            const st = await this.detectPageState();
+            if (st === "error" || st === "cf") break;
             const ok = await this.page.evaluate(() => {
               const t = (document.body?.innerText || "").toLowerCase();
               return (
@@ -577,19 +710,23 @@ export class FaucetWorker {
               );
             });
             if (ok) break;
-            await sleep(150);
+            await sleep(120);
           }
 
           {
-            const cf = await this.detectCloudflareBlock();
-            if (cf.blocked) {
-              this.log("CF after Send#1 — refresh now");
-              await sleep(400);
+            const st = await this.detectPageState();
+            if (st === "error" || st === "cf") {
+              this.log(`${st} after Send#1 — refresh`);
+              await sleep(200);
               continue;
             }
           }
 
-          const siteKeys = await this.extractSiteKeys(networkKeys);
+          const siteKeys = await this.withTimeout(
+            "extractSiteKeys",
+            () => this.extractSiteKeys(networkKeys),
+            8000,
+          );
           this.log(`keys: ${siteKeys.map((k) => k.slice(0, 10)).join(",")}`);
 
           let token = null;
@@ -618,32 +755,54 @@ export class FaucetWorker {
             }
           }
           if (!token) {
-            this.log(`CapSolver failed — refresh & retry: ${lastErr}`);
-            await sleep(1000);
+            this.log(`CapSolver failed — refresh: ${lastErr}`);
+            await sleep(400);
             continue;
           }
           if (this.page.isClosed()) {
-            this.log("tab closed — reopen browser");
+            this.log("tab closed — reopen");
             await this.resetBrowser().catch(() => {});
             continue;
           }
 
-          this.setStatus("submitting", "Inject token…");
-          await injectRecaptchaToken(this.page, token);
-          await sleep(120);
-          await injectRecaptchaToken(this.page, token);
+          // Page still form?
+          if ((await this.detectPageState()) !== "form") {
+            this.log("lost form during captcha — refresh");
+            continue;
+          }
 
-          this.setStatus("submitting", "Send #2…");
-          btn = this.sendBtn();
+          await this.withTimeout(
+            "inject+send2",
+            async () => {
+              this.setStatus("submitting", "Inject token…");
+              await injectRecaptchaToken(this.page, token);
+              await sleep(100);
+              await injectRecaptchaToken(this.page, token);
+              this.setStatus("submitting", "Send #2…");
+              const btn2 = this.sendBtn();
+              await btn2
+                .click({ timeout: 6000 })
+                .catch(() => btn2.click({ force: true }));
+            },
+            15000,
+          );
+
           const before = apiHits.length;
-          await btn
-            .click({ timeout: 8000 })
-            .catch(() => btn.click({ force: true }));
-
           this.setStatus("submitting", "Waiting API…");
           let outcome = "unknown";
-          const deadline = Date.now() + 25000;
+          const deadline = Date.now() + 20000;
           while (Date.now() < deadline) {
+            // error page mid-submit?
+            const st = await this.detectPageState();
+            if (st === "error") {
+              outcome = "error_page";
+              break;
+            }
+            if (st === "cf") {
+              outcome = "cf";
+              break;
+            }
+
             for (const hit of apiHits.slice(before)) {
               const b = (hit.body || "").toLowerCase();
               if (hit.status >= 200 && hit.status < 300) {
@@ -679,14 +838,17 @@ export class FaucetWorker {
               outcome = "limit";
               break;
             }
-            // CF mid-wait
+            if (/something went wrong/i.test(live)) {
+              outcome = "error_page";
+              break;
+            }
             if (
               /error 1015|you are being rate limited|access denied/i.test(live)
             ) {
               outcome = "cf";
               break;
             }
-            await sleep(250);
+            await sleep(200);
           }
 
           if (outcome === "unknown") {
@@ -700,25 +862,24 @@ export class FaucetWorker {
 
           this.log(`outcome=${outcome} attempt=${attempt}`);
 
-          // Permanent only: real per-wallet 2h faucet limit
           if (outcome === "limit") {
             throw new Error(
               "Faucet limit exceeded (20 USDC / address / 2h). Use new wallet.",
             );
           }
 
-          // Everything else: refresh and try again
           if (
             outcome === "captcha_fail" ||
             outcome === "cf" ||
+            outcome === "error_page" ||
             outcome === "unknown"
           ) {
             this.log(`${outcome} — refresh & retry now`);
-            await sleep(300);
+            await sleep(250);
             continue;
           }
 
-          // success / soft_success
+          // success
           this.setStatus("done", `OK run #${myRun}`);
           await this.page
             .goto(FAUCET_URL, {
@@ -730,7 +891,6 @@ export class FaucetWorker {
           return { ok: true, runId: myRun, outcome };
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          // Permanent wallet limit bubbles out
           if (
             /20 usdc \/ address|faucet limit exceeded|every 2h|last 2h/i.test(
               msg,
@@ -738,20 +898,12 @@ export class FaucetWorker {
           ) {
             throw e;
           }
-          // Any other error: refresh immediately and retry
           this.lastError = msg;
-          this.log(`fail: ${msg.slice(0, 120)} — refresh now`);
+          this.log(`fail: ${msg.slice(0, 140)} — refresh now`);
           if (/closed|target page|context|browser has been closed/i.test(msg)) {
             await this.resetBrowser().catch(() => {});
           } else {
-            try {
-              await this.page?.goto(FAUCET_URL, {
-                waitUntil: "commit",
-                timeout: 20000,
-              });
-            } catch {
-              /* openFaucet next loop */
-            }
+            await this.hardRefresh().catch(() => {});
           }
           await sleep(300);
         }
