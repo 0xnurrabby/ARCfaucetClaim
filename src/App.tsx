@@ -236,11 +236,17 @@ export default function App() {
     };
   }, []);
 
-  // Push saved config once bot is online
+  // Push saved config once when bot becomes online (not on every settings render)
+  const configPushedRef = useRef(false);
   useEffect(() => {
-    if (!botOnline) return;
-    void pushConfigToBot(settings);
-  }, [botOnline, settings, pushConfigToBot]);
+    if (!botOnline) {
+      configPushedRef.current = false;
+      return;
+    }
+    if (configPushedRef.current) return;
+    configPushedRef.current = true;
+    void pushConfigToBot(settingsRef.current);
+  }, [botOnline, pushConfigToBot]);
 
   const stats = useMemo(() => {
     const total = wallets.length;
@@ -880,7 +886,7 @@ export default function App() {
           <div>
             <h2>Settings</h2>
             <p className="card-desc">
-              Save once. Values stay in this browser and in the bot `.env`.
+              Save once. Values stay in this browser and bot runtime config.
             </p>
           </div>
 

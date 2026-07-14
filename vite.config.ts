@@ -6,5 +6,16 @@ export default defineConfig({
   server: {
     port: 5173,
     open: true,
+    watch: {
+      // Bot writes config/keys here — never restart Vite for these
+      ignored: [
+        "**/.env",
+        "**/.env.*",
+        "**/server/runtime-config.json",
+        "**/.browser-profile/**",
+        "**/.browser-profile-w*/**",
+        "**/node_modules/**",
+      ],
+    },
   },
 });

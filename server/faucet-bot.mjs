@@ -13,9 +13,12 @@ import { FaucetWorker } from "./worker.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
+/** Runtime config (NOT .env) so Vite does not restart on every save */
+const CONFIG_PATH = join(__dirname, "runtime-config.json");
 const ENV_PATH = join(ROOT, ".env");
 
 function loadEnvFile() {
+  // optional .env for initial secrets (read-only; bot never writes this)
   if (!existsSync(ENV_PATH)) return;
   for (const line of readFileSync(ENV_PATH, "utf8").split(/\r?\n/)) {
     const t = line.trim();
@@ -35,24 +38,27 @@ function loadEnvFile() {
 }
 loadEnvFile();
 
-function persistEnv(key, value) {
-  const lines = existsSync(ENV_PATH)
-    ? readFileSync(ENV_PATH, "utf8").split(/\r?\n/)
-    : [];
-  let found = false;
-  const next = lines.map((line) => {
-    if (new RegExp(`^\\s*${key}\\s*=`).test(line)) {
-      found = true;
-      return `${key}=${value}`;
-    }
-    return line;
-  });
-  if (!found) next.push(`${key}=${value}`);
-  writeFileSync(
-    ENV_PATH,
-    `${next.filter((l, idx, arr) => l || idx < arr.length - 1).join("\n")}\n`,
-    "utf8",
-  );
+function loadRuntimeConfig() {
+  try {
+    if (!existsSync(CONFIG_PATH)) return {};
+    return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function persistRuntimeConfig(patch) {
+  const cur = loadRuntimeConfig();
+  const next = { ...cur, ...patch, updatedAt: new Date().toISOString() };
+  writeFileSync(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return next;
+}
+
+// Apply saved runtime config once at boot
+{
+  const cfg = loadRuntimeConfig();
+  if (cfg.CAPSOLVER_API_KEY) process.env.CAPSOLVER_API_KEY = cfg.CAPSOLVER_API_KEY;
+  if (cfg.ARC_RPC_URL) process.env.ARC_RPC_URL = cfg.ARC_RPC_URL;
 }
 
 const PORT = 8787;
@@ -157,7 +163,7 @@ app.post("/config/capsolver", async (req, res) => {
   runtimeCapsolverKey = key;
   process.env.CAPSOLVER_API_KEY = key;
   try {
-    persistEnv("CAPSOLVER_API_KEY", key);
+    persistRuntimeConfig({ CAPSOLVER_API_KEY: key });
   } catch {
     /* ignore */
   }
@@ -200,7 +206,7 @@ app.post("/config/rpc", (req, res) => {
   rpcUrl = url;
   process.env.ARC_RPC_URL = url;
   try {
-    persistEnv("ARC_RPC_URL", url);
+    persistRuntimeConfig({ ARC_RPC_URL: url });
   } catch {
     /* ignore */
   }

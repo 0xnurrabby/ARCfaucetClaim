@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .env.local
+server/runtime-config.json
 .browser-profile/
 .browser-profile-w*/
 *.log
