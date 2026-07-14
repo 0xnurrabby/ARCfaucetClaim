@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getCapsolverBalance } from "./capsolver.mjs";
 import { checkRecentFaucetClaim } from "./claim-check.mjs";
-import { FaucetWorker } from "./worker.mjs";
+import { FaucetWorker, shutdownSharedBrowser } from "./worker.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -74,7 +74,7 @@ let recentLogs = [];
 let cfBlockedUntil = 0;
 let lastStartAt = 0;
 /** Min gap between starting claims (ms) to reduce CF 1015 */
-const START_STAGGER_MS = 2500;
+const START_STAGGER_MS = 1200;
 
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -86,11 +86,14 @@ function getApiKey() {
   return (runtimeCapsolverKey || process.env.CAPSOLVER_API_KEY || "").trim();
 }
 
-function markCloudflareBan(minutes = 15) {
+function markCloudflareBan(minutes = 8) {
+  // Soft cooldown: don't freeze the whole queue for too long
   const until = Date.now() + minutes * 60_000;
   if (until > cfBlockedUntil) {
     cfBlockedUntil = until;
-    log(`Cloudflare ban cooldown until ${new Date(cfBlockedUntil).toLocaleTimeString()}`);
+    log(
+      `Cloudflare cooldown until ${new Date(cfBlockedUntil).toLocaleTimeString()} (${minutes}m)`,
+    );
   }
 }
 
@@ -179,10 +182,23 @@ app.get("/status", (_req, res) => {
   });
 });
 
-app.post("/config/workers", (req, res) => {
+app.post("/config/workers", async (req, res) => {
   const n = Number(req.body?.count) || 1;
   const count = ensureWorkers(n);
-  res.json({ ok: true, workerCount: count });
+  // Pre-warm a few contexts so first wave starts together (not one-by-one forever)
+  const warm = Math.min(count, 6);
+  res.json({ ok: true, workerCount: count, warming: warm });
+  // fire-and-forget warm so HTTP returns fast
+  void (async () => {
+    for (let i = 0; i < warm; i++) {
+      try {
+        if (!workers[i].busy) await workers[i].ensureContext();
+      } catch (e) {
+        log(`warm W${workers[i].id}: ${e instanceof Error ? e.message : e}`);
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  })();
 });
 
 app.post("/config/capsolver", async (req, res) => {
@@ -380,6 +396,7 @@ app.post("/faucet/cancel", async (req, res) => {
 
 app.post("/faucet/shutdown-browser", async (_req, res) => {
   await Promise.all(workers.map((w) => w.shutdown()));
+  await shutdownSharedBrowser();
   res.json({ ok: true });
 });
 
@@ -392,5 +409,6 @@ app.listen(PORT, "127.0.0.1", () => {
 
 process.on("SIGINT", async () => {
   await Promise.all(workers.map((w) => w.shutdown()));
+  await shutdownSharedBrowser();
   process.exit(0);
 });

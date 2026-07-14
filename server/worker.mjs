@@ -1,24 +1,78 @@
 /**
- * One browser worker — independent Chrome context for parallel faucet claims.
+ * One faucet worker = one browser context (tab group).
+ * All workers share a single Chromium/Chrome process for stability at high parallel counts.
  */
 import { chromium } from "playwright";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { solveRecaptchaV2, orderSiteKeys } from "./capsolver.mjs";
 import { injectRecaptchaToken } from "./recaptcha-inject.mjs";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = join(__dirname, "..");
 const FAUCET_URL = "https://faucet.circle.com/";
 const FALLBACK_SITEKEYS = [
   "6LcCqC8sAAAAAHGuWXnlpxcEYJD3lE_EFLebNnve",
   "6LcNs_0pAAAAAJuAAa-VQryi8XsocHubBk-YlUy2",
 ];
-const VISIBLE_KEY = FALLBACK_SITEKEYS[0];
 const INVIS_KEY = FALLBACK_SITEKEYS[1];
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** @type {import('playwright').Browser | null} */
+let sharedBrowser = null;
+let browserLaunchPromise = null;
+
+async function getSharedBrowser(onLog = () => {}) {
+  if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+  if (browserLaunchPromise) return browserLaunchPromise;
+
+  browserLaunchPromise = (async () => {
+    onLog("[browser] launching shared Chrome process…");
+    const args = [
+      "--disable-blink-features=AutomationControlled",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-dev-shm-usage",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
+    ];
+    try {
+      sharedBrowser = await chromium.launch({
+        channel: "chrome",
+        headless: false,
+        args,
+        ignoreDefaultArgs: ["--enable-automation"],
+      });
+    } catch {
+      sharedBrowser = await chromium.launch({
+        headless: false,
+        args,
+        ignoreDefaultArgs: ["--enable-automation"],
+      });
+    }
+    sharedBrowser.on("disconnected", () => {
+      sharedBrowser = null;
+      browserLaunchPromise = null;
+    });
+    onLog("[browser] shared process ready");
+    return sharedBrowser;
+  })();
+
+  try {
+    return await browserLaunchPromise;
+  } finally {
+    browserLaunchPromise = null;
+  }
+}
+
+export async function shutdownSharedBrowser() {
+  try {
+    if (sharedBrowser) await sharedBrowser.close();
+  } catch {
+    /* ignore */
+  }
+  sharedBrowser = null;
+  browserLaunchPromise = null;
 }
 
 export class FaucetWorker {
@@ -40,6 +94,10 @@ export class FaucetWorker {
     this.busy = false;
     this.runId = 0;
     this.logs = [];
+    /** @type {((...args: any[]) => void) | null} */
+    this._onReq = null;
+    /** @type {((...args: any[]) => void) | null} */
+    this._onRes = null;
   }
 
   log(msg) {
@@ -67,47 +125,43 @@ export class FaucetWorker {
     };
   }
 
-  async ensureBrowser() {
+  detachPageListeners() {
+    if (!this.page) return;
+    try {
+      if (this._onReq) this.page.off("request", this._onReq);
+      if (this._onRes) this.page.off("response", this._onRes);
+    } catch {
+      /* ignore */
+    }
+    this._onReq = null;
+    this._onRes = null;
+  }
+
+  async ensureContext() {
+    // Reuse healthy context
     if (this.context) {
       try {
-        this.context.pages();
-        return;
+        const pages = this.context.pages();
+        if (pages) {
+          this.page =
+            pages.find((p) => !p.isClosed()) || (await this.context.newPage());
+          return;
+        }
       } catch {
         this.context = null;
         this.page = null;
       }
     }
 
-    const profile = join(ROOT, `.browser-profile-w${this.id}`);
-    const common = {
-      headless: false,
-      viewport: null,
+    const browser = await getSharedBrowser((m) => this.onLog(m));
+    const col = (this.id * 37) % 800;
+    const row = (this.id * 29) % 400;
+
+    this.context = await browser.newContext({
+      viewport: { width: 1100, height: 800 },
       locale: "en-US",
-      args: [
-        "--start-maximized",
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        `--window-position=${40 + this.id * 40},${40 + this.id * 30}`,
-        "--window-size=1280,900",
-      ],
-      ignoreDefaultArgs: ["--enable-automation"],
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    };
-
-    try {
-      this.context = await chromium.launchPersistentContext(profile, {
-        ...common,
-        channel: "chrome",
-      });
-    } catch {
-      this.context = await chromium.launchPersistentContext(profile, common);
-    }
-
-    this.context.on("close", () => {
-      this.context = null;
-      this.page = null;
     });
 
     await this.context.addInitScript(() => {
@@ -116,12 +170,38 @@ export class FaucetWorker {
       window.chrome = { runtime: {} };
     });
 
-    // close junk tabs
-    for (const p of this.context.pages().slice(1)) {
-      await p.close().catch(() => {});
+    this.page = await this.context.newPage();
+    this.page.setDefaultTimeout(15000);
+
+    // Best-effort window placement (may no-op)
+    try {
+      await this.page.evaluate(
+        ({ x, y }) => {
+          try {
+            window.moveTo(x, y);
+          } catch {
+            /* ignore */
+          }
+        },
+        { x: 20 + col, y: 20 + row },
+      );
+    } catch {
+      /* ignore */
     }
-    this.page = this.context.pages()[0] || (await this.context.newPage());
-    this.log("browser ready");
+
+    this.log("context ready");
+  }
+
+  async resetContext() {
+    this.detachPageListeners();
+    try {
+      await this.page?.close().catch(() => {});
+      await this.context?.close().catch(() => {});
+    } catch {
+      /* ignore */
+    }
+    this.page = null;
+    this.context = null;
   }
 
   async detectCloudflareBlock() {
@@ -130,8 +210,6 @@ export class FaucetWorker {
         const t = (document.body?.innerText || "").toLowerCase();
         const title = (document.title || "").toLowerCase();
         return {
-          title,
-          text: t.slice(0, 1500),
           has1015: t.includes("error 1015") || t.includes("1015"),
           rateLimited:
             t.includes("you are being rate limited") ||
@@ -144,7 +222,7 @@ export class FaucetWorker {
         return {
           blocked: true,
           message:
-            "Cloudflare Error 1015: IP rate limited by faucet.circle.com. Lower parallel browsers and wait 10-30 min.",
+            "Cloudflare Error 1015: IP rate limited. Lower parallel browsers and wait.",
         };
       }
       return { blocked: false };
@@ -154,26 +232,22 @@ export class FaucetWorker {
   }
 
   async openFaucet() {
-    await this.ensureBrowser();
+    await this.ensureContext();
     if (!this.page || this.page.isClosed()) {
       this.page = await this.context.newPage();
     }
     this.page.setDefaultTimeout(15000);
     this.setStatus("running", "Opening faucet…");
+
     await this.page.goto(FAUCET_URL, {
       waitUntil: "domcontentloaded",
       timeout: 45000,
     });
-    try {
-      await this.page.bringToFront();
-    } catch {
-      /* ignore */
-    }
 
-    // Cloudflare IP ban page has no wallet form
     const cf = await this.detectCloudflareBlock();
     if (cf.blocked) {
       const err = new Error(cf.message);
+      // @ts-ignore
       err.code = "CF_1015";
       throw err;
     }
@@ -188,13 +262,32 @@ export class FaucetWorker {
       const cf2 = await this.detectCloudflareBlock();
       if (cf2.blocked) {
         const err = new Error(cf2.message);
+        // @ts-ignore
         err.code = "CF_1015";
         throw err;
       }
-      throw new Error(
-        "Faucet form not loaded (timeout). Cloudflare may be blocking this IP.",
-      );
+      // recreate context once and retry
+      this.log("form missing — resetting context and retrying once");
+      await this.resetContext();
+      await this.ensureContext();
+      await this.page.goto(FAUCET_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 45000,
+      });
+      const cf3 = await this.detectCloudflareBlock();
+      if (cf3.blocked) {
+        const err = new Error(cf3.message);
+        // @ts-ignore
+        err.code = "CF_1015";
+        throw err;
+      }
+      await this.page
+        .getByPlaceholder(/wallet address/i)
+        .or(this.page.locator('input[placeholder*="address" i]'))
+        .first()
+        .waitFor({ state: "visible", timeout: 20000 });
     }
+
     await this.sendBtn()
       .waitFor({ state: "visible", timeout: 10000 })
       .catch(() => {});
@@ -213,13 +306,12 @@ export class FaucetWorker {
 
   async fillForm(address) {
     const p = this.page;
-    // USDC + Arc often already default — only click if needed (fast path)
     try {
-      const usdc = p
+      await p
         .getByRole("button", { name: /^USDC$/i })
         .or(p.locator("button").filter({ hasText: /^USDC$/ }))
-        .first();
-      await usdc.click({ timeout: 1500 });
+        .first()
+        .click({ timeout: 1500 });
     } catch {
       /* ok */
     }
@@ -302,7 +394,8 @@ export class FaucetWorker {
       const networkKeys = [];
       const apiHits = [];
 
-      const onReq = (req) => {
+      this.detachPageListeners();
+      this._onReq = (req) => {
         const u = req.url();
         if (/recaptcha/i.test(u)) {
           try {
@@ -313,7 +406,7 @@ export class FaucetWorker {
           }
         }
       };
-      const onRes = async (res) => {
+      this._onRes = async (res) => {
         try {
           const url = res.url();
           const kind = res.request().resourceType();
@@ -336,8 +429,8 @@ export class FaucetWorker {
           /* ignore */
         }
       };
-      this.page.on("request", onReq);
-      this.page.on("response", onRes);
+      this.page.on("request", this._onReq);
+      this.page.on("response", this._onRes);
 
       this.setStatus("running", "Filling form…");
       await this.fillForm(address);
@@ -351,7 +444,6 @@ export class FaucetWorker {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       await btn.click({ timeout: 10000 }).catch(() => btn.click({ force: true }));
 
-      // wait captcha ui briefly
       for (let i = 0; i < 20; i++) {
         const ok = await this.page.evaluate(() => {
           const t = (document.body?.innerText || "").toLowerCase();
@@ -467,53 +559,53 @@ export class FaucetWorker {
       }
 
       this.setStatus("done", `OK run #${myRun}`);
-      // quick reload for next job (commit = faster)
       await this.page
-        .goto(FAUCET_URL, { waitUntil: "commit", timeout: 15000 })
+        .goto(FAUCET_URL, { waitUntil: "domcontentloaded", timeout: 15000 })
         .catch(() => {});
       this.setStatus("idle", `Ready (last #${myRun} OK)`);
       return { ok: true, runId: myRun, outcome };
     } catch (e) {
       this.lastError = e instanceof Error ? e.message : String(e);
       this.setStatus("error", this.lastError);
-      try {
-        if (this.page && !this.page.isClosed()) {
-          await this.page
-            .goto(FAUCET_URL, { waitUntil: "domcontentloaded", timeout: 15000 })
-            .catch(() => {});
+      // recreate context after hard failures so next job works
+      if (
+        /1015|cloudflare|timeout|closed|target page|context|browser/i.test(
+          this.lastError,
+        )
+      ) {
+        await this.resetContext().catch(() => {});
+      } else {
+        try {
+          if (this.page && !this.page.isClosed()) {
+            await this.page
+              .goto(FAUCET_URL, {
+                waitUntil: "domcontentloaded",
+                timeout: 12000,
+              })
+              .catch(() => {});
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
       }
-      // flip idle so next job can use worker
       this.status = "idle";
       throw e;
     } finally {
+      this.detachPageListeners();
       this.busy = false;
     }
   }
 
   async cancel() {
     this.busy = false;
+    this.detachPageListeners();
     this.setStatus("idle", "Cancelled");
-    try {
-      if (this.page && !this.page.isClosed()) {
-        await this.page.goto(FAUCET_URL, { timeout: 10000 }).catch(() => {});
-      }
-    } catch {
-      /* ignore */
-    }
   }
 
   async shutdown() {
     this.busy = false;
-    try {
-      await this.page?.close().catch(() => {});
-      await this.context?.close().catch(() => {});
-    } finally {
-      this.page = null;
-      this.context = null;
-      this.setStatus("idle", "Shutdown");
-    }
+    this.detachPageListeners();
+    await this.resetContext();
+    this.setStatus("idle", "Shutdown");
   }
 }

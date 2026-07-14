@@ -550,12 +550,14 @@ export default function App() {
         startData.cloudflare ||
         startData.retryable
       ) {
-        const waitSec = Number(startData.remainingSec) || 5 + attempt * 3;
+        // Cap wait so 25-browser runs don't freeze for minutes on each wallet
+        const raw = Number(startData.remainingSec) || 3 + attempt * 2;
+        const waitSec = Math.min(raw, startData.cloudflare ? 30 : 8);
         pushLog(
           `[${shortAddress(job.address)}] wait ${waitSec}s (${String(startData.error || startRes.status)})`,
           "info",
         );
-        await sleep(Math.min(waitSec, 60) * 1000);
+        await sleep(waitSec * 1000);
         continue;
       }
 
@@ -607,18 +609,20 @@ export default function App() {
       }
       // Cloudflare / form timeout: re-queue later instead of permanent error
       if (
-        /1015|cloudflare|ip rate limited|form not loaded|timeout/i.test(msg)
+        /1015|cloudflare|ip rate limited|form not loaded|timeout|context|browser/i.test(
+          msg,
+        )
       ) {
         patchWallet(job.id, {
           status: "queued",
-          error: "CF/network temporary - will retry",
+          error: "temporary - retry",
           workerId: null,
         });
         pushLog(
-          `[${shortAddress(job.address)}] temporary fail, re-queued: ${msg.slice(0, 80)}`,
+          `[${shortAddress(job.address)}] re-queued: ${msg.slice(0, 90)}`,
           "info",
         );
-        await sleep(8000);
+        await sleep(2500);
         return;
       }
       patchWallet(job.id, { status: "error", error: msg, workerId: null });
