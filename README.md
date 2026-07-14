@@ -4,7 +4,7 @@ Local tool for Arc Testnet builders:
 
 - Import many wallet private keys
 - Claim Circle testnet USDC with CapSolver (reCAPTCHA)
-- Run up to **30 parallel Chrome browsers**
+- Run up to **30 separate Chrome browsers** (open one-by-one, then work in parallel)
 - Skip wallets that already claimed in the last **2 hours** (Alchemy / RPC history)
 - Auto-drain USDC to your vault wallet
 

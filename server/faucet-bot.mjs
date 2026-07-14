@@ -73,8 +73,8 @@ let recentLogs = [];
 /** Global Cloudflare ban cooldown (ms timestamp) */
 let cfBlockedUntil = 0;
 let lastStartAt = 0;
-/** Min gap between starting claims (ms) to reduce CF 1015 */
-const START_STAGGER_MS = 1200;
+/** Min gap between starting claims (ms) — browsers open one-by-one */
+const START_STAGGER_MS = 1800;
 
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -185,20 +185,8 @@ app.get("/status", (_req, res) => {
 app.post("/config/workers", async (req, res) => {
   const n = Number(req.body?.count) || 1;
   const count = ensureWorkers(n);
-  // Pre-warm a few contexts so first wave starts together (not one-by-one forever)
-  const warm = Math.min(count, 6);
-  res.json({ ok: true, workerCount: count, warming: warm });
-  // fire-and-forget warm so HTTP returns fast
-  void (async () => {
-    for (let i = 0; i < warm; i++) {
-      try {
-        if (!workers[i].busy) await workers[i].ensureContext();
-      } catch (e) {
-        log(`warm W${workers[i].id}: ${e instanceof Error ? e.message : e}`);
-      }
-      await new Promise((r) => setTimeout(r, 200));
-    }
-  })();
+  // Do NOT pre-open all browsers (causes IP stress). They open one-by-one on first job.
+  res.json({ ok: true, workerCount: count, mode: "separate-browsers-one-by-one" });
 });
 
 app.post("/config/capsolver", async (req, res) => {
