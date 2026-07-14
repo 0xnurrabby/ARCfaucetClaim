@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+.browser-profile/
+.browser-profile-w*/
+*.log
+.DS_Store
+tsconfig.tsbuildinfo
