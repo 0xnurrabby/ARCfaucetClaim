@@ -533,6 +533,26 @@ export class FaucetWorker {
           this.page.on("request", this._onReq);
           this.page.on("response", this._onRes);
 
+          // Keep this window "active" even when not focused (Windows freezes bg Chrome otherwise)
+          try {
+            await this.page.evaluate(() => {
+              try {
+                window.focus();
+              } catch {
+                /* ignore */
+              }
+            });
+            const cdp = await this.context.newCDPSession(this.page);
+            await cdp
+              .send("Emulation.setFocusEmulationEnabled", { enabled: true })
+              .catch(() => {});
+            await cdp
+              .send("Page.setWebLifecycleState", { state: "active" })
+              .catch(() => {});
+          } catch {
+            /* optional */
+          }
+
           // Form is already visible → work immediately, no extra wait
           this.setStatus("running", "Filling form…");
           await this.fillForm(address);
