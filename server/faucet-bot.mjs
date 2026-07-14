@@ -70,6 +70,11 @@ let rpcUrl = DEFAULT_RPC;
 /** @type {FaucetWorker[]} */
 let workers = [];
 let recentLogs = [];
+/** Global Cloudflare ban cooldown (ms timestamp) */
+let cfBlockedUntil = 0;
+let lastStartAt = 0;
+/** Min gap between starting claims (ms) to reduce CF 1015 */
+const START_STAGGER_MS = 2500;
 
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -81,19 +86,40 @@ function getApiKey() {
   return (runtimeCapsolverKey || process.env.CAPSOLVER_API_KEY || "").trim();
 }
 
+function markCloudflareBan(minutes = 15) {
+  const until = Date.now() + minutes * 60_000;
+  if (until > cfBlockedUntil) {
+    cfBlockedUntil = until;
+    log(`Cloudflare ban cooldown until ${new Date(cfBlockedUntil).toLocaleTimeString()}`);
+  }
+}
+
+function cloudflareStatus() {
+  const now = Date.now();
+  if (now >= cfBlockedUntil) {
+    return { blocked: false, remainingSec: 0 };
+  }
+  return {
+    blocked: true,
+    remainingSec: Math.ceil((cfBlockedUntil - now) / 1000),
+    until: cfBlockedUntil,
+  };
+}
+
 function ensureWorkers(n) {
   const count = Math.max(1, Math.min(30, Number(n) || 1));
-  // create missing
   while (workers.length < count) {
     const id = workers.length + 1;
     const w = new FaucetWorker(id, (m) => {
       recentLogs = [m, ...recentLogs].slice(0, 60);
       console.log(m);
+      if (/1015|cloudflare|ip rate limited/i.test(m)) {
+        markCloudflareBan(15);
+      }
     });
     workers.push(w);
     log(`worker ${id} created`);
   }
-  // shutdown extras
   while (workers.length > count) {
     const w = workers.pop();
     void w.shutdown();
@@ -103,12 +129,14 @@ function ensureWorkers(n) {
 }
 
 function poolSnapshot() {
+  const cf = cloudflareStatus();
   return {
     workers: workers.map((w) => w.snapshot()),
     workerCount: workers.length,
     busyCount: workers.filter((w) => w.busy).length,
     hasCapsolverKey: Boolean(getApiKey()),
     rpcUrl: rpcUrl.replace(/\/v2\/.*/, "/v2/***"),
+    cloudflare: cf,
     logs: recentLogs.slice(0, 20),
   };
 }
@@ -249,6 +277,17 @@ app.post("/faucet/start", async (req, res) => {
     return res.status(400).json({ error: "CapSolver API key required" });
   }
 
+  // Global Cloudflare IP ban cooldown
+  const cf = cloudflareStatus();
+  if (cf.blocked) {
+    return res.status(503).json({
+      error: `Cloudflare IP ban active. Wait ~${cf.remainingSec}s then lower parallel browsers (try 2-4).`,
+      cloudflare: true,
+      remainingSec: cf.remainingSec,
+      retryable: true,
+    });
+  }
+
   // optional pre-check
   if (req.body?.skipCheck !== true) {
     try {
@@ -277,10 +316,31 @@ app.post("/faucet/start", async (req, res) => {
         error: "All workers busy",
         workerCount: workers.length,
         busyCount: workers.filter((w) => w.busy).length,
+        retryable: true,
       });
     }
   }
 
+  // Stagger starts so N browsers do not hit CF at the same second
+  const wait = Math.max(0, START_STAGGER_MS - (Date.now() - lastStartAt));
+  if (wait > 0) {
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  // re-check CF after wait
+  const cf2 = cloudflareStatus();
+  if (cf2.blocked) {
+    return res.status(503).json({
+      error: `Cloudflare IP ban active. Wait ~${cf2.remainingSec}s.`,
+      cloudflare: true,
+      remainingSec: cf2.remainingSec,
+      retryable: true,
+    });
+  }
+  if (worker.busy) {
+    return res.status(409).json({ error: "Worker became busy", retryable: true });
+  }
+
+  lastStartAt = Date.now();
   const runId = worker.runId + 1;
   res.json({
     ok: true,
@@ -288,9 +348,12 @@ app.post("/faucet/start", async (req, res) => {
     runId,
   });
 
-  // fire and forget
   worker.run(address, getApiKey()).catch((e) => {
-    log(`W${worker.id} failed: ${e instanceof Error ? e.message : e}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`W${worker.id} failed: ${msg}`);
+    if (/1015|cloudflare|ip rate limited|banned you temporarily/i.test(msg)) {
+      markCloudflareBan(15);
+    }
   });
 });
 

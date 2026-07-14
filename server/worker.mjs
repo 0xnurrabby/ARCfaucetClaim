@@ -124,16 +124,44 @@ export class FaucetWorker {
     this.log("browser ready");
   }
 
+  async detectCloudflareBlock() {
+    try {
+      const info = await this.page.evaluate(() => {
+        const t = (document.body?.innerText || "").toLowerCase();
+        const title = (document.title || "").toLowerCase();
+        return {
+          title,
+          text: t.slice(0, 1500),
+          has1015: t.includes("error 1015") || t.includes("1015"),
+          rateLimited:
+            t.includes("you are being rate limited") ||
+            t.includes("access denied") ||
+            t.includes("banned you temporarily") ||
+            title.includes("access denied"),
+        };
+      });
+      if (info.has1015 || info.rateLimited) {
+        return {
+          blocked: true,
+          message:
+            "Cloudflare Error 1015: IP rate limited by faucet.circle.com. Lower parallel browsers and wait 10-30 min.",
+        };
+      }
+      return { blocked: false };
+    } catch {
+      return { blocked: false };
+    }
+  }
+
   async openFaucet() {
     await this.ensureBrowser();
     if (!this.page || this.page.isClosed()) {
       this.page = await this.context.newPage();
     }
-    this.page.setDefaultTimeout(12000);
+    this.page.setDefaultTimeout(15000);
     this.setStatus("running", "Opening faucet…");
-    // commit is faster than full domcontentloaded wait when page is cached
     await this.page.goto(FAUCET_URL, {
-      waitUntil: "commit",
+      waitUntil: "domcontentloaded",
       timeout: 45000,
     });
     try {
@@ -142,11 +170,31 @@ export class FaucetWorker {
       /* ignore */
     }
 
+    // Cloudflare IP ban page has no wallet form
+    const cf = await this.detectCloudflareBlock();
+    if (cf.blocked) {
+      const err = new Error(cf.message);
+      err.code = "CF_1015";
+      throw err;
+    }
+
     const addressInput = this.page
       .getByPlaceholder(/wallet address/i)
       .or(this.page.locator('input[placeholder*="address" i]'))
       .first();
-    await addressInput.waitFor({ state: "visible", timeout: 20000 });
+    try {
+      await addressInput.waitFor({ state: "visible", timeout: 20000 });
+    } catch {
+      const cf2 = await this.detectCloudflareBlock();
+      if (cf2.blocked) {
+        const err = new Error(cf2.message);
+        err.code = "CF_1015";
+        throw err;
+      }
+      throw new Error(
+        "Faucet form not loaded (timeout). Cloudflare may be blocking this IP.",
+      );
+    }
     await this.sendBtn()
       .waitFor({ state: "visible", timeout: 10000 })
       .catch(() => {});
