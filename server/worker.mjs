@@ -1,6 +1,6 @@
 /**
- * One faucet worker = one separate Chrome/Chromium browser window.
- * Browsers open one-by-one (staggered) so IP/CPU is less stressed.
+ * One worker = one separate Chrome window (persistent profile).
+ * Browsers open one-by-one via a launch queue; after open they work in parallel.
  */
 import { chromium } from "playwright";
 import { join, dirname } from "node:path";
@@ -21,16 +21,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Serialize browser launches so windows open one-by-one */
+/** Open browsers one-by-one (not all at once) */
 let launchChain = Promise.resolve();
 function queueLaunch(fn) {
   const run = launchChain.then(fn, fn);
-  launchChain = run.catch(() => {});
+  // keep chain alive even if one launch fails
+  launchChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
   return run;
 }
 
 export async function shutdownSharedBrowser() {
-  // no shared browser in this mode
+  // no shared browser
 }
 
 export class FaucetWorker {
@@ -41,8 +45,6 @@ export class FaucetWorker {
   constructor(id, onLog = () => {}) {
     this.id = id;
     this.onLog = onLog;
-    /** @type {import('playwright').Browser | null} */
-    this.browser = null;
     /** @type {import('playwright').BrowserContext | null} */
     this.context = null;
     /** @type {import('playwright').Page | null} */
@@ -54,10 +56,9 @@ export class FaucetWorker {
     this.busy = false;
     this.runId = 0;
     this.logs = [];
-    /** @type {((...args: any[]) => void) | null} */
     this._onReq = null;
-    /** @type {((...args: any[]) => void) | null} */
     this._onRes = null;
+    this._launching = false;
   }
 
   log(msg) {
@@ -97,79 +98,105 @@ export class FaucetWorker {
     this._onRes = null;
   }
 
+  isContextAlive() {
+    if (!this.context) return false;
+    try {
+      this.context.pages();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * Open a SEPARATE browser window for this worker (one at a time globally).
+   * Separate Chrome window per worker.
+   * Launch is queued globally so windows open 1,2,3... not all at once.
    */
   async ensureBrowser() {
-    if (this.browser && this.browser.isConnected() && this.context && this.page) {
+    if (this.isContextAlive()) {
       try {
-        if (!this.page.isClosed()) return;
+        if (this.page && !this.page.isClosed()) return;
+        this.page = this.context.pages()[0] || (await this.context.newPage());
+        return;
       } catch {
-        /* recreate */
+        /* recreate below */
       }
+    }
+
+    if (this._launching) {
+      // wait until current launch finishes
+      while (this._launching) await sleep(100);
+      if (this.isContextAlive() && this.page && !this.page.isClosed()) return;
     }
 
     await this.resetBrowser();
 
-    await queueLaunch(async () => {
-      this.setStatus("running", `Opening browser #${this.id}…`);
-      const profile = join(ROOT, `.browser-profile-w${this.id}`);
-      const col = ((this.id - 1) % 5) * 40;
-      const row = Math.floor((this.id - 1) / 5) * 40;
-      const args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-dev-shm-usage",
-        `--window-position=${30 + col},${30 + row}`,
-        "--window-size=1200,850",
-      ];
+    this._launching = true;
+    try {
+      await queueLaunch(async () => {
+        this.setStatus("running", `Opening browser #${this.id}…`);
+        const profile = join(ROOT, `.browser-profile-w${this.id}`);
+        const col = ((this.id - 1) % 5) * 36;
+        const row = Math.floor((this.id - 1) / 5) * 36;
+        const args = [
+          "--disable-blink-features=AutomationControlled",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-dev-shm-usage",
+          `--window-position=${24 + col},${24 + row}`,
+          "--window-size=1180,820",
+        ];
 
-      try {
-        // Separate persistent profile = separate Chrome window
-        this.context = await chromium.launchPersistentContext(profile, {
-          channel: "chrome",
-          headless: false,
-          viewport: null,
-          locale: "en-US",
-          args,
-          ignoreDefaultArgs: ["--enable-automation"],
-          userAgent:
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        try {
+          this.context = await chromium.launchPersistentContext(profile, {
+            channel: "chrome",
+            headless: false,
+            viewport: null,
+            locale: "en-US",
+            args,
+            ignoreDefaultArgs: ["--enable-automation"],
+            userAgent:
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          });
+        } catch {
+          this.context = await chromium.launchPersistentContext(profile, {
+            headless: false,
+            viewport: null,
+            locale: "en-US",
+            args,
+            ignoreDefaultArgs: ["--enable-automation"],
+          });
+        }
+
+        this.context.on("close", () => {
+          this.context = null;
+          this.page = null;
         });
-      } catch {
-        this.context = await chromium.launchPersistentContext(profile, {
-          headless: false,
-          viewport: null,
-          locale: "en-US",
-          args,
-          ignoreDefaultArgs: ["--enable-automation"],
+
+        await this.context.addInitScript(() => {
+          Object.defineProperty(navigator, "webdriver", {
+            get: () => undefined,
+          });
+          // @ts-ignore
+          window.chrome = { runtime: {} };
         });
-      }
 
-      this.context.on("close", () => {
-        this.context = null;
-        this.page = null;
-        this.browser = null;
+        for (const p of this.context.pages().slice(1)) {
+          await p.close().catch(() => {});
+        }
+        this.page = this.context.pages()[0] || (await this.context.newPage());
+        this.page.setDefaultTimeout(15000);
+        this.log(`browser #${this.id} open`);
+        // gap between window opens
+        await sleep(500);
       });
+    } finally {
+      this._launching = false;
+    }
+  }
 
-      await this.context.addInitScript(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-        // @ts-ignore
-        window.chrome = { runtime: {} };
-      });
-
-      // one page
-      for (const p of this.context.pages().slice(1)) {
-        await p.close().catch(() => {});
-      }
-      this.page = this.context.pages()[0] || (await this.context.newPage());
-      this.page.setDefaultTimeout(15000);
-      this.log(`browser #${this.id} open`);
-
-      // small gap so next worker launch is truly one-by-one
-      await sleep(400);
-    });
+  async ensureContext() {
+    return this.ensureBrowser();
   }
 
   async resetBrowser() {
@@ -177,13 +204,11 @@ export class FaucetWorker {
     try {
       await this.page?.close().catch(() => {});
       await this.context?.close().catch(() => {});
-      await this.browser?.close().catch(() => {});
     } catch {
       /* ignore */
     }
     this.page = null;
     this.context = null;
-    this.browser = null;
   }
 
   async detectCloudflareBlock() {
@@ -204,7 +229,7 @@ export class FaucetWorker {
         return {
           blocked: true,
           message:
-            "Cloudflare Error 1015: IP rate limited. Lower parallel browsers and wait.",
+            "Cloudflare Error 1015: IP rate limited. Lower parallel and wait.",
         };
       }
       return { blocked: false };
@@ -258,11 +283,6 @@ export class FaucetWorker {
     if (!this.page.url().includes("faucet.circle.com")) {
       throw new Error(`Wrong URL: ${this.page.url()}`);
     }
-  }
-
-  // alias used by bot warm-up
-  async ensureContext() {
-    return this.ensureBrowser();
   }
 
   sendBtn() {
@@ -368,7 +388,9 @@ export class FaucetWorker {
         if (/recaptcha/i.test(u)) {
           try {
             const k = new URL(u).searchParams.get("k");
-            if (k?.startsWith("6L") && !networkKeys.includes(k)) networkKeys.push(k);
+            if (k?.startsWith("6L") && !networkKeys.includes(k)) {
+              networkKeys.push(k);
+            }
           } catch {
             /* ignore */
           }
@@ -454,7 +476,6 @@ export class FaucetWorker {
         }
       }
       if (!token) throw new Error(`CapSolver failed: ${lastErr}`);
-
       if (this.page.isClosed()) throw new Error("Tab closed during CapSolver");
 
       this.setStatus("submitting", "Inject token…");
@@ -516,7 +537,6 @@ export class FaucetWorker {
       }
 
       this.log(`outcome=${outcome} run=${myRun}`);
-
       if (outcome === "limit") {
         throw new Error(
           "Faucet limit exceeded (20 USDC / address / 2h). Use new wallet.",
@@ -535,11 +555,8 @@ export class FaucetWorker {
     } catch (e) {
       this.lastError = e instanceof Error ? e.message : String(e);
       this.setStatus("error", this.lastError);
-      if (
-        /1015|cloudflare|timeout|closed|target page|context|browser/i.test(
-          this.lastError,
-        )
-      ) {
+      // keep browser open for soft errors; only reset on hard crashes
+      if (/closed|target page|context|browser has been closed/i.test(this.lastError)) {
         await this.resetBrowser().catch(() => {});
       }
       this.status = "idle";

@@ -73,8 +73,8 @@ let recentLogs = [];
 /** Global Cloudflare ban cooldown (ms timestamp) */
 let cfBlockedUntil = 0;
 let lastStartAt = 0;
-/** Min gap between starting claims (ms) — browsers open one-by-one */
-const START_STAGGER_MS = 1800;
+/** Soft gap only for logging/metrics — do NOT block /faucet/start for minutes */
+const START_STAGGER_MS = 400;
 
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -86,13 +86,13 @@ function getApiKey() {
   return (runtimeCapsolverKey || process.env.CAPSOLVER_API_KEY || "").trim();
 }
 
-function markCloudflareBan(minutes = 8) {
-  // Soft cooldown: don't freeze the whole queue for too long
-  const until = Date.now() + minutes * 60_000;
+function markCloudflareBan(seconds = 45) {
+  // SHORT soft cooldown only — never freeze all 25 workers for 5-15 minutes
+  const until = Date.now() + seconds * 1000;
   if (until > cfBlockedUntil) {
     cfBlockedUntil = until;
     log(
-      `Cloudflare cooldown until ${new Date(cfBlockedUntil).toLocaleTimeString()} (${minutes}m)`,
+      `Cloudflare soft cooldown ${seconds}s (until ${new Date(cfBlockedUntil).toLocaleTimeString()})`,
     );
   }
 }
@@ -117,7 +117,7 @@ function ensureWorkers(n) {
       recentLogs = [m, ...recentLogs].slice(0, 60);
       console.log(m);
       if (/1015|cloudflare|ip rate limited/i.test(m)) {
-        markCloudflareBan(15);
+        markCloudflareBan(45);
       }
     });
     workers.push(w);
@@ -281,13 +281,13 @@ app.post("/faucet/start", async (req, res) => {
     return res.status(400).json({ error: "CapSolver API key required" });
   }
 
-  // Global Cloudflare IP ban cooldown
+  // Soft CF throttle only (short). Do NOT hard-block the whole pool for minutes.
   const cf = cloudflareStatus();
   if (cf.blocked) {
     return res.status(503).json({
-      error: `Cloudflare IP ban active. Wait ~${cf.remainingSec}s then lower parallel browsers (try 2-4).`,
+      error: `Cloudflare soft cooldown ~${cf.remainingSec}s (browsers still open one-by-one after).`,
       cloudflare: true,
-      remainingSec: cf.remainingSec,
+      remainingSec: Math.min(cf.remainingSec, 45),
       retryable: true,
     });
   }
@@ -312,7 +312,7 @@ app.post("/faucet/start", async (req, res) => {
   if (req.body?.workerId) {
     worker = workers.find((w) => w.id === Number(req.body.workerId));
     if (!worker) return res.status(404).json({ error: "Worker not found" });
-    if (worker.busy) return res.status(409).json({ error: "Worker busy" });
+    if (worker.busy) return res.status(409).json({ error: "Worker busy", retryable: true });
   } else {
     worker = workers.find((w) => !w.busy);
     if (!worker) {
@@ -325,38 +325,27 @@ app.post("/faucet/start", async (req, res) => {
     }
   }
 
-  // Stagger starts so N browsers do not hit CF at the same second
-  const wait = Math.max(0, START_STAGGER_MS - (Date.now() - lastStartAt));
-  if (wait > 0) {
-    await new Promise((r) => setTimeout(r, wait));
-  }
-  // re-check CF after wait
-  const cf2 = cloudflareStatus();
-  if (cf2.blocked) {
-    return res.status(503).json({
-      error: `Cloudflare IP ban active. Wait ~${cf2.remainingSec}s.`,
-      cloudflare: true,
-      remainingSec: cf2.remainingSec,
-      retryable: true,
-    });
-  }
+  // Tiny non-blocking stagger bookkeeping only (browser open is already one-by-one)
+  lastStartAt = Date.now();
+  const runId = worker.runId + 1;
+
+  // Mark busy immediately so two jobs don't grab same worker
   if (worker.busy) {
     return res.status(409).json({ error: "Worker became busy", retryable: true });
   }
 
-  lastStartAt = Date.now();
-  const runId = worker.runId + 1;
   res.json({
     ok: true,
     workerId: worker.id,
     runId,
   });
 
+  // Fire and forget — browser opens inside worker via one-by-one launch queue
   worker.run(address, getApiKey()).catch((e) => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`W${worker.id} failed: ${msg}`);
     if (/1015|cloudflare|ip rate limited|banned you temporarily/i.test(msg)) {
-      markCloudflareBan(15);
+      markCloudflareBan(45);
     }
   });
 });

@@ -550,9 +550,9 @@ export default function App() {
         startData.cloudflare ||
         startData.retryable
       ) {
-        // Cap wait so 25-browser runs don't freeze for minutes on each wallet
-        const raw = Number(startData.remainingSec) || 3 + attempt * 2;
-        const waitSec = Math.min(raw, startData.cloudflare ? 30 : 8);
+        // Short waits only — never sleep 5+ minutes per wallet
+        const raw = Number(startData.remainingSec) || 2 + attempt;
+        const waitSec = Math.min(raw, startData.cloudflare ? 8 : 3);
         pushLog(
           `[${shortAddress(job.address)}] wait ${waitSec}s (${String(startData.error || startRes.status)})`,
           "info",
@@ -622,7 +622,7 @@ export default function App() {
           `[${shortAddress(job.address)}] re-queued: ${msg.slice(0, 90)}`,
           "info",
         );
-        await sleep(2500);
+        await sleep(1200);
         return;
       }
       patchWallet(job.id, { status: "error", error: msg, workerId: null });
