@@ -138,34 +138,41 @@ export class FaucetWorker {
         const profile = join(ROOT, `.browser-profile-w${this.id}`);
         const col = ((this.id - 1) % 5) * 36;
         const row = Math.floor((this.id - 1) / 5) * 36;
+        // Critical: stop Windows/Chrome from freezing background windows
+        // (without this, only the focused browser runs timers/network)
         const args = [
           "--disable-blink-features=AutomationControlled",
           "--no-first-run",
           "--no-default-browser-check",
           "--disable-dev-shm-usage",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-renderer-backgrounding",
+          "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
+          "--disable-ipc-flooding-protection",
+          "--process-per-site",
           `--window-position=${24 + col},${24 + row}`,
-          "--window-size=1180,820",
+          "--window-size=1100,780",
         ];
+
+        const common = {
+          headless: false,
+          // fixed viewport keeps page "active" even when window is occluded
+          viewport: { width: 1100, height: 780 },
+          locale: "en-US",
+          args,
+          ignoreDefaultArgs: ["--enable-automation"],
+          userAgent:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        };
 
         try {
           this.context = await chromium.launchPersistentContext(profile, {
+            ...common,
             channel: "chrome",
-            headless: false,
-            viewport: null,
-            locale: "en-US",
-            args,
-            ignoreDefaultArgs: ["--enable-automation"],
-            userAgent:
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
           });
         } catch {
-          this.context = await chromium.launchPersistentContext(profile, {
-            headless: false,
-            viewport: null,
-            locale: "en-US",
-            args,
-            ignoreDefaultArgs: ["--enable-automation"],
-          });
+          this.context = await chromium.launchPersistentContext(profile, common);
         }
 
         this.context.on("close", () => {
@@ -179,16 +186,62 @@ export class FaucetWorker {
           });
           // @ts-ignore
           window.chrome = { runtime: {} };
+          // Keep timers alive when tab is in background
+          try {
+            Object.defineProperty(document, "hidden", {
+              get: () => false,
+              configurable: true,
+            });
+            Object.defineProperty(document, "visibilityState", {
+              get: () => "visible",
+              configurable: true,
+            });
+            document.addEventListener(
+              "visibilitychange",
+              (e) => {
+                e.stopImmediatePropagation();
+              },
+              true,
+            );
+          } catch {
+            /* ignore */
+          }
         });
+
+        // CDP: disable background throttling at protocol level
+        try {
+          const cdp = await this.context.newCDPSession(
+            this.context.pages()[0] || (await this.context.newPage()),
+          );
+          await cdp.send("Page.enable").catch(() => {});
+          await cdp
+            .send("Emulation.setFocusEmulationEnabled", { enabled: true })
+            .catch(() => {});
+          // @ts-ignore - keep network/timers active
+          await cdp
+            .send("Page.setWebLifecycleState", { state: "active" })
+            .catch(() => {});
+        } catch {
+          /* optional */
+        }
 
         for (const p of this.context.pages().slice(1)) {
           await p.close().catch(() => {});
         }
         this.page = this.context.pages()[0] || (await this.context.newPage());
         this.page.setDefaultTimeout(15000);
-        this.log(`browser #${this.id} open`);
-        // gap between window opens
-        await sleep(500);
+
+        // Ensure page thinks it is focused/visible
+        try {
+          await this.page.evaluate(() => {
+            window.focus();
+          });
+        } catch {
+          /* ignore */
+        }
+
+        this.log(`browser #${this.id} open (bg-throttle off)`);
+        await sleep(400);
       });
     } finally {
       this._launching = false;
