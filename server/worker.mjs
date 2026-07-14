@@ -239,7 +239,38 @@ export class FaucetWorker {
   }
 
   /**
-   * Load faucet page. On CF 1015 / blank page: hard refresh and keep trying.
+   * Wait until wallet form is visible (poll fast — start work the moment page is ready).
+   * @param {number} maxMs
+   */
+  async waitForFormReady(maxMs = 12000) {
+    const end = Date.now() + maxMs;
+    const addressInput = this.page
+      .getByPlaceholder(/wallet address/i)
+      .or(this.page.locator('input[placeholder*="address" i]'))
+      .first();
+    while (Date.now() < end) {
+      if (this.page.isClosed()) return false;
+      const cf = await this.detectCloudflareBlock();
+      if (cf.blocked) return false;
+      try {
+        if (await addressInput.isVisible().catch(() => false)) {
+          // Send button may appear a tick later — don't block long
+          await this.sendBtn()
+            .waitFor({ state: "visible", timeout: 2000 })
+            .catch(() => {});
+          return true;
+        }
+      } catch {
+        /* keep polling */
+      }
+      await sleep(150);
+    }
+    return false;
+  }
+
+  /**
+   * Load faucet page. On CF 1015 / blank: refresh and keep trying.
+   * As soon as form appears → return immediately (no stuck waiting).
    */
   async openFaucet() {
     await this.ensureBrowser();
@@ -252,64 +283,48 @@ export class FaucetWorker {
       attempt += 1;
       this.setStatus(
         "running",
-        attempt === 1 ? "Opening faucet…" : `Refresh retry #${attempt}…`,
+        attempt === 1 ? "Opening faucet…" : `Refresh #${attempt}…`,
       );
 
       try {
-        // Hard navigation = full refresh
+        // commit = return as soon as navigation starts loading (faster than full load)
         await this.page.goto(FAUCET_URL, {
-          waitUntil: "domcontentloaded",
-          timeout: 45000,
+          waitUntil: "commit",
+          timeout: 30000,
         });
       } catch (e) {
-        this.log(
-          `goto fail: ${e instanceof Error ? e.message : e} — refresh again`,
-        );
-        await sleep(1500);
+        this.log(`goto fail — retry: ${e instanceof Error ? e.message : e}`);
+        await sleep(600);
         continue;
+      }
+
+      // Poll: the moment form is there, go work (don't sit idle)
+      const ready = await this.waitForFormReady(10000);
+      if (ready) {
+        this.log("form ready — starting claim");
+        return;
       }
 
       const cf = await this.detectCloudflareBlock();
       if (cf.blocked) {
-        this.log(`CF/rate page hit — refresh & retry #${attempt}`);
-        await sleep(2000);
-        // hard reload
-        try {
-          await this.page.reload({
-            waitUntil: "domcontentloaded",
-            timeout: 30000,
-          });
-        } catch {
-          /* next loop will goto again */
-        }
-        await sleep(1500);
-        continue;
+        this.log(`CF/rate page — hard refresh #${attempt}`);
+      } else {
+        this.log(`form not ready — hard refresh #${attempt}`);
       }
 
-      const addressInput = this.page
-        .getByPlaceholder(/wallet address/i)
-        .or(this.page.locator('input[placeholder*="address" i]'))
-        .first();
       try {
-        await addressInput.waitFor({ state: "visible", timeout: 15000 });
+        await this.page.goto(FAUCET_URL, {
+          waitUntil: "commit",
+          timeout: 30000,
+        });
       } catch {
-        this.log(`form not ready — refresh & retry #${attempt}`);
-        await sleep(1500);
-        continue;
+        try {
+          await this.page.reload({ waitUntil: "commit", timeout: 20000 });
+        } catch {
+          /* loop */
+        }
       }
-
-      await this.sendBtn()
-        .waitFor({ state: "visible", timeout: 8000 })
-        .catch(() => {});
-
-      if (!this.page.url().includes("faucet.circle.com")) {
-        this.log(`wrong url ${this.page.url()} — refresh`);
-        await sleep(1000);
-        continue;
-      }
-
-      // form ready
-      return;
+      await sleep(400);
     }
   }
 
@@ -465,6 +480,7 @@ export class FaucetWorker {
           this.page.on("request", this._onReq);
           this.page.on("response", this._onRes);
 
+          // Form is already visible → work immediately, no extra wait
           this.setStatus("running", "Filling form…");
           await this.fillForm(address);
 
@@ -472,10 +488,13 @@ export class FaucetWorker {
           let btn = this.sendBtn();
           await btn.scrollIntoViewIfNeeded().catch(() => {});
           await btn
-            .click({ timeout: 10000 })
+            .click({ timeout: 8000 })
             .catch(() => btn.click({ force: true }));
 
-          for (let i = 0; i < 20; i++) {
+          // Short captcha UI poll (don't stall)
+          for (let i = 0; i < 12; i++) {
+            const cfMid = await this.detectCloudflareBlock();
+            if (cfMid.blocked) break;
             const ok = await this.page.evaluate(() => {
               const t = (document.body?.innerText || "").toLowerCase();
               return (
@@ -485,15 +504,14 @@ export class FaucetWorker {
               );
             });
             if (ok) break;
-            await sleep(250);
+            await sleep(150);
           }
 
-          // CF page after send?
           {
             const cf = await this.detectCloudflareBlock();
             if (cf.blocked) {
-              this.log("CF after Send#1 — refresh & retry");
-              await sleep(1500);
+              this.log("CF after Send#1 — refresh now");
+              await sleep(400);
               continue;
             }
           }
@@ -622,8 +640,8 @@ export class FaucetWorker {
             outcome === "cf" ||
             outcome === "unknown"
           ) {
-            this.log(`${outcome} — browser refresh & retry`);
-            await sleep(1200);
+            this.log(`${outcome} — refresh & retry now`);
+            await sleep(300);
             continue;
           }
 
@@ -647,29 +665,22 @@ export class FaucetWorker {
           ) {
             throw e;
           }
-          // Any other error: refresh and retry forever
+          // Any other error: refresh immediately and retry
           this.lastError = msg;
-          this.log(`fail: ${msg.slice(0, 120)} — refresh & retry`);
+          this.log(`fail: ${msg.slice(0, 120)} — refresh now`);
           if (/closed|target page|context|browser has been closed/i.test(msg)) {
             await this.resetBrowser().catch(() => {});
           } else {
             try {
-              await this.page?.reload({
-                waitUntil: "domcontentloaded",
+              await this.page?.goto(FAUCET_URL, {
+                waitUntil: "commit",
                 timeout: 20000,
               });
             } catch {
-              try {
-                await this.page?.goto(FAUCET_URL, {
-                  waitUntil: "domcontentloaded",
-                  timeout: 30000,
-                });
-              } catch {
-                /* next openFaucet will handle */
-              }
+              /* openFaucet next loop */
             }
           }
-          await sleep(1500);
+          await sleep(300);
         }
       }
     } catch (e) {
